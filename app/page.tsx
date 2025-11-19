@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
-import { Play, Pause, Download, Upload, RefreshCw, Type, Undo2 } from 'lucide-react';
+import { Play, Pause, Download, Upload, RefreshCw, Type, Undo2, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight } from 'lucide-react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
@@ -36,6 +36,8 @@ export default function SyncStudio() {
 
   const audioRef = useRef<HTMLAudioElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const hasInitialized = useRef(false);
+  const wordPlayEndTime = useRef<number | null>(null);
 
   // --- Initialization Logic ---
   const initializeWords = useCallback(() => {
@@ -54,9 +56,14 @@ export default function SyncStudio() {
     }
   }, [scriptText]);
 
+  // Only initialize words on first mount
   useEffect(() => {
-    initializeWords();
-  }, [initializeWords]);
+    if (!hasInitialized.current) {
+      initializeWords();
+      hasInitialized.current = true;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Empty dependency array - only run once on mount
 
   // --- Event Handlers ---
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -76,14 +83,16 @@ export default function SyncStudio() {
         try {
           const content = event.target?.result as string;
           const parsedData = JSON.parse(content);
-          
+
           if (parsedData.text && parsedData.words) {
             setScriptText(parsedData.text);
             const newWords = parsedData.words.map((w: any, i: number) => ({
                 id: i,
-                text: w.word,
-                time: w.time === 0 ? null : w.time,
-                endTime: w.endTime || null
+                // Support both 'word' (old format) and 'text' (new format)
+                text: w.word || w.text,
+                // Keep time as-is if it's a number (including 0), otherwise null
+                time: typeof w.time === 'number' ? w.time : null,
+                endTime: typeof w.endTime === 'number' ? w.endTime : null
             }));
             setWords(newWords);
             setSyncIndex(0);
@@ -108,10 +117,43 @@ export default function SyncStudio() {
     if (!audioRef.current) return;
     if (isPlaying) {
       audioRef.current.pause();
+      wordPlayEndTime.current = null;
     } else {
       audioRef.current.play();
     }
     setIsPlaying(!isPlaying);
+  };
+
+  const seekAudio = (delta: number) => {
+    if (!audioRef.current) return;
+    const newTime = Math.max(0, Math.min(audioRef.current.currentTime + delta, audioRef.current.duration || 0));
+    audioRef.current.currentTime = newTime;
+    setCurrentTime(newTime);
+    // Clear word play mode when manually seeking
+    wordPlayEndTime.current = null;
+  };
+
+  const playWord = (wordIndex: number) => {
+    if (!audioRef.current || wordIndex >= words.length) return;
+    const word = words[wordIndex];
+    if (word.time === null) return;
+
+    // Calculate end time
+    let endTime: number;
+    if (word.endTime !== null) {
+      endTime = word.endTime;
+    } else if (wordIndex < words.length - 1 && words[wordIndex + 1].time !== null) {
+      endTime = words[wordIndex + 1].time!;
+    } else {
+      endTime = word.time + 0.5; // Default 0.5s if no end time
+    }
+
+    // Set up word play mode
+    wordPlayEndTime.current = endTime;
+    audioRef.current.currentTime = word.time;
+    audioRef.current.play();
+    setIsPlaying(true);
+    setSyncIndex(wordIndex);
   };
 
   const recordTimestamp = () => {
@@ -149,12 +191,32 @@ export default function SyncStudio() {
     }
   };
 
-  // Global Keydown Listener for Spacebar Syncing
+  // Global Keydown Listener for Spacebar Syncing and Arrow Key Seeking
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Spacebar for syncing
       if (isSyncing && e.code === 'Space') {
         e.preventDefault();
         recordTimestamp();
+      }
+
+      // Arrow keys for seeking (when not typing in an input)
+      if (!isSyncing && (e.target as HTMLElement).tagName !== 'INPUT' && (e.target as HTMLElement).tagName !== 'TEXTAREA') {
+        if (e.code === 'ArrowLeft') {
+          e.preventDefault();
+          if (e.shiftKey) {
+            seekAudio(-1); // Shift+Left: 1s back
+          } else {
+            seekAudio(-0.1); // Left: 0.1s back
+          }
+        } else if (e.code === 'ArrowRight') {
+          e.preventDefault();
+          if (e.shiftKey) {
+            seekAudio(1); // Shift+Right: 1s forward
+          } else {
+            seekAudio(0.1); // Right: 0.1s forward
+          }
+        }
       }
     };
 
@@ -195,6 +257,28 @@ export default function SyncStudio() {
     updateTime();
     return () => cancelAnimationFrame(raf);
   }, []);
+
+  // Word playback control - use timeupdate event for precise stopping
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+
+    const handleTimeUpdate = () => {
+      if (wordPlayEndTime.current !== null) {
+        // Check if we've reached or passed the end time
+        if (audio.currentTime >= wordPlayEndTime.current - 0.01) {
+          audio.pause();
+          setIsPlaying(false);
+          wordPlayEndTime.current = null;
+        }
+      }
+    };
+
+    audio.addEventListener('timeupdate', handleTimeUpdate);
+    return () => {
+      audio.removeEventListener('timeupdate', handleTimeUpdate);
+    };
+  }, [audioSrc]); // Re-run when audio source changes
 
 
   // --- Generation Logic ---
@@ -342,135 +426,170 @@ export default function SyncStudio() {
 
 
   return (
-    <div className="min-h-screen bg-neutral-950 text-white font-sans p-6 flex flex-col gap-6">
+    <div className="h-screen bg-neutral-950 text-white font-sans p-4 flex flex-col gap-3 overflow-hidden">
       {/* Header */}
-      <header className="flex items-center justify-between border-b border-neutral-800 pb-4">
-        <h1 className="text-2xl font-bold tracking-tighter flex items-center gap-2">
-          <Type className="w-6 h-6 text-blue-500" />
+      <header className="flex items-center justify-between border-b border-neutral-800 pb-2">
+        <h1 className="text-xl font-bold tracking-tighter flex items-center gap-2">
+          <Type className="w-5 h-5 text-blue-500" />
           SyncStudio
         </h1>
         <div className="flex gap-2">
-           <label className="bg-neutral-800 hover:bg-neutral-700 text-white px-4 py-2 rounded-md flex items-center gap-2 text-sm transition-colors cursor-pointer">
-              <Upload className="w-4 h-4" /> Upload JSON
+           <label className="bg-neutral-800 hover:bg-neutral-700 text-white px-3 py-1.5 rounded-md flex items-center gap-2 text-xs transition-colors cursor-pointer">
+              <Upload className="w-3 h-3" /> Upload JSON
               <input type="file" accept=".json" onChange={handleJSONUpload} className="hidden" />
            </label>
-           <button 
+           <button
              onClick={handleExportJSON}
-             className="bg-neutral-800 hover:bg-neutral-700 text-white px-4 py-2 rounded-md flex items-center gap-2 text-sm transition-colors"
+             className="bg-neutral-800 hover:bg-neutral-700 text-white px-3 py-1.5 rounded-md flex items-center gap-2 text-xs transition-colors"
            >
-             <Download className="w-4 h-4" /> Save JSON
+             <Download className="w-3 h-3" /> Save JSON
            </button>
-           <button 
+           <button
             onClick={handleGenerateVideo}
             disabled={isRendering || !audioSrc || !words.length}
-            className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white px-4 py-2 rounded-md flex items-center gap-2 text-sm transition-colors font-bold">
+            className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white px-3 py-1.5 rounded-md flex items-center gap-2 text-xs transition-colors font-bold">
             {isRendering ? (
                 <>
-                    <RefreshCw className="w-4 h-4 animate-spin" /> Rendering...
+                    <RefreshCw className="w-3 h-3 animate-spin" /> Rendering...
                 </>
             ) : (
                 <>
-                    <Type className="w-4 h-4" /> Generate Video
+                    <Type className="w-3 h-3" /> Generate Video
                 </>
             )}
           </button>
         </div>
       </header>
 
-      <main className="flex-1 grid grid-cols-1 lg:grid-cols-3 gap-8">
+      <main className="flex-1 grid grid-cols-1 lg:grid-cols-3 gap-4 overflow-hidden min-h-0">
         
         {/* Left Panel: Controls */}
-        <div className="flex flex-col gap-6 lg:col-span-1">
-          
+        <div className="flex flex-col gap-3 lg:col-span-1 overflow-hidden min-h-0">
+
           {/* 1. Audio Upload */}
-          <div className="bg-neutral-900 p-4 rounded-lg border border-neutral-800 space-y-3">
-            <h2 className="font-semibold text-neutral-400 text-sm uppercase tracking-wider">1. Audio Source</h2>
-            <label className="flex items-center gap-3 cursor-pointer bg-neutral-800 hover:bg-neutral-700 p-3 rounded border border-dashed border-neutral-600 transition-colors">
-              <Upload className="w-5 h-5 text-neutral-400" />
-              <span className="text-sm text-neutral-300">
+          <div className="bg-neutral-900 p-3 rounded-lg border border-neutral-800 space-y-2">
+            <h2 className="font-semibold text-neutral-400 text-xs uppercase tracking-wider">1. Audio Source</h2>
+            <label className="flex items-center gap-2 cursor-pointer bg-neutral-800 hover:bg-neutral-700 p-2 rounded border border-dashed border-neutral-600 transition-colors">
+              <Upload className="w-4 h-4 text-neutral-400" />
+              <span className="text-xs text-neutral-300">
                 {audioSrc ? "Audio Loaded" : "Click to Upload Audio"}
               </span>
               <input type="file" accept="audio/*" onChange={handleFileChange} className="hidden" />
             </label>
-            <audio ref={audioRef} src={audioSrc} onEnded={() => setIsPlaying(false)} onPlay={() => setIsPlaying(true)} onPause={() => setIsPlaying(false)} />
+            <audio ref={audioRef} src={audioSrc || undefined} onEnded={() => setIsPlaying(false)} onPlay={() => setIsPlaying(true)} onPause={() => setIsPlaying(false)} />
           </div>
 
           {/* 2. Script Input */}
-          <div className="bg-neutral-900 p-4 rounded-lg border border-neutral-800 space-y-3 flex-1 flex flex-col max-h-[300px]">
-             <div className="flex justify-between items-center">
-                <h2 className="font-semibold text-neutral-400 text-sm uppercase tracking-wider">2. Script</h2>
+          <div className="bg-neutral-900 p-3 rounded-lg border border-neutral-800 flex flex-col min-h-0" style={{height: '20vh'}}>
+             <div className="flex justify-between items-center mb-2">
+                <h2 className="font-semibold text-neutral-400 text-xs uppercase tracking-wider">2. Script</h2>
                 <button onClick={initializeWords} className="text-xs text-blue-400 hover:text-blue-300 flex items-center gap-1">
                   <RefreshCw className="w-3 h-3" /> Reset
                 </button>
              </div>
-             <textarea 
-                className="flex-1 bg-neutral-950 border border-neutral-800 rounded p-3 text-neutral-300 font-mono text-sm focus:ring-1 focus:ring-blue-500 outline-none resize-none"
+             <textarea
+                className="flex-1 bg-neutral-950 border border-neutral-800 rounded p-2 text-neutral-300 font-mono text-xs focus:ring-1 focus:ring-blue-500 outline-none resize-none min-h-0"
                 value={scriptText}
                 onChange={(e) => setScriptText(e.target.value)}
                 placeholder="Paste your script here..."
              />
           </div>
-          
+
           {/* Timestamps Editor */}
-          <div className="bg-neutral-900 p-4 rounded-lg border border-neutral-800 space-y-3 flex-1 flex flex-col max-h-[300px] overflow-hidden">
-              <div className="flex justify-between items-center pb-2 border-b border-neutral-800">
-                <h2 className="font-semibold text-neutral-400 text-sm uppercase tracking-wider">Timestamps</h2>
+          <div className="bg-neutral-900 p-3 rounded-lg border border-neutral-800 flex flex-col overflow-hidden min-h-0 flex-1">
+              <div className="flex justify-between items-center pb-2 border-b border-neutral-800 mb-2">
+                <h2 className="font-semibold text-neutral-400 text-xs uppercase tracking-wider">Timestamps</h2>
                 <div className="grid grid-cols-4 gap-2 text-[10px] text-neutral-500 uppercase font-bold w-[60%] text-center pr-8">
                     <span className="col-span-2">Start</span>
                     <span className="col-span-2">End</span>
                 </div>
               </div>
-              <div className="flex-1 overflow-y-auto space-y-1 pr-2">
+              <div className="flex-1 overflow-y-auto space-y-1 pr-2 min-h-0">
                   {words.map((w, i) => (
-                      <div key={i} className={cn("grid grid-cols-6 gap-2 items-center text-xs p-2 rounded", i === syncIndex ? "bg-blue-900/30" : "hover:bg-neutral-800")}>
-                          <span className="col-span-2 truncate text-neutral-300" title={w.text}>{w.text}</span>
-                          
+                      <div key={i} className={cn("grid grid-cols-6 gap-2 items-center text-xs p-1.5 rounded", i === syncIndex ? "bg-blue-900/30" : "hover:bg-neutral-800")}>
+                          <span className="col-span-2 truncate text-neutral-300 text-[11px]" title={w.text}>{w.text}</span>
+
                           {/* Start Time */}
-                          <input 
-                            type="number" 
-                            step="0.01" 
-                            className="col-span-1 bg-neutral-950 border border-neutral-700 rounded px-1 py-0.5 text-right outline-none focus:border-blue-500"
-                            value={typeof w.time === 'number' ? w.time.toFixed(2) : ""}
+                          <input
+                            type="text"
+                            inputMode="decimal"
+                            className="col-span-1 bg-neutral-950 border border-neutral-700 rounded px-1 py-0.5 text-right outline-none focus:border-blue-500 text-[11px]"
+                            defaultValue={typeof w.time === 'number' ? w.time.toString() : ""}
                             placeholder="Start"
-                            onChange={(e) => {
-                                const val = parseFloat(e.target.value);
-                                setWords(prev => {
-                                    const next = [...prev];
-                                    next[i].time = isNaN(val) ? null : val;
-                                    return next;
-                                });
+                            onBlur={(e) => {
+                                const val = e.target.value.trim();
+                                if (val === '') {
+                                    setWords(prev => {
+                                        const next = [...prev];
+                                        next[i].time = null;
+                                        return next;
+                                    });
+                                    e.target.value = '';
+                                } else {
+                                    const parsed = parseFloat(val);
+                                    if (!isNaN(parsed)) {
+                                        setWords(prev => {
+                                            const next = [...prev];
+                                            next[i].time = parsed;
+                                            return next;
+                                        });
+                                        e.target.value = parsed.toString();
+                                    } else {
+                                        // Reset to previous value if invalid
+                                        e.target.value = typeof w.time === 'number' ? w.time.toString() : "";
+                                    }
+                                }
+                            }}
+                            onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                    e.currentTarget.blur();
+                                }
                             }}
                           />
 
                           {/* End Time */}
-                          <input 
-                            type="number" 
-                            step="0.01" 
-                            className="col-span-1 bg-neutral-950 border border-neutral-700 rounded px-1 py-0.5 text-right outline-none focus:border-blue-500 text-neutral-400 focus:text-white"
-                            value={typeof w.endTime === 'number' ? w.endTime.toFixed(2) : ""}
+                          <input
+                            type="text"
+                            inputMode="decimal"
+                            className="col-span-1 bg-neutral-950 border border-neutral-700 rounded px-1 py-0.5 text-right outline-none focus:border-blue-500 text-neutral-400 focus:text-white text-[11px]"
+                            defaultValue={typeof w.endTime === 'number' ? w.endTime.toString() : ""}
                             placeholder="Auto"
-                            onChange={(e) => {
-                                const val = parseFloat(e.target.value);
-                                setWords(prev => {
-                                    const next = [...prev];
-                                    next[i].endTime = isNaN(val) ? null : val;
-                                    return next;
-                                });
+                            onBlur={(e) => {
+                                const val = e.target.value.trim();
+                                if (val === '') {
+                                    setWords(prev => {
+                                        const next = [...prev];
+                                        next[i].endTime = null;
+                                        return next;
+                                    });
+                                    e.target.value = '';
+                                } else {
+                                    const parsed = parseFloat(val);
+                                    if (!isNaN(parsed)) {
+                                        setWords(prev => {
+                                            const next = [...prev];
+                                            next[i].endTime = parsed;
+                                            return next;
+                                        });
+                                        e.target.value = parsed.toString();
+                                    } else {
+                                        // Reset to previous value if invalid
+                                        e.target.value = typeof w.endTime === 'number' ? w.endTime.toString() : "";
+                                    }
+                                }
+                            }}
+                            onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                    e.currentTarget.blur();
+                                }
                             }}
                           />
 
                           <div className="col-span-1 flex justify-end">
-                             <button 
-                                onClick={() => {
-                                    if (audioRef.current && w.time !== null) {
-                                        audioRef.current.currentTime = w.time;
-                                        audioRef.current.play();
-                                        setIsPlaying(true);
-                                        setSyncIndex(i);
-                                    }
-                                }}
+                             <button
+                                onClick={() => playWord(i)}
                                 disabled={w.time === null || !audioSrc}
-                                className="p-1.5 bg-neutral-700 hover:bg-neutral-600 rounded flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
+                                className="p-1 bg-neutral-700 hover:bg-neutral-600 rounded flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                                 title="Play Word"
                               >
                                 <Play className="w-3 h-3 text-white" />
@@ -482,13 +601,13 @@ export default function SyncStudio() {
           </div>
 
           {/* 3. Sync & Format Controls */}
-          <div className="bg-neutral-900 p-4 rounded-lg border border-neutral-800 space-y-4">
+          <div className="bg-neutral-900 p-3 rounded-lg border border-neutral-800 space-y-3">
              {/* Format Controls */}
              <div className="flex justify-between items-center">
-                 <h2 className="font-semibold text-neutral-400 text-sm uppercase tracking-wider">3. Format & Sync</h2>
+                 <h2 className="font-semibold text-neutral-400 text-xs uppercase tracking-wider">3. Format & Sync</h2>
                  <div className="flex gap-2">
-                     <select 
-                        value={aspectRatio} 
+                     <select
+                        value={aspectRatio}
                         onChange={(e) => setAspectRatio(e.target.value as any)}
                         className="bg-neutral-800 text-white text-xs px-2 py-1 rounded border border-neutral-700 outline-none"
                      >
@@ -496,46 +615,46 @@ export default function SyncStudio() {
                          <option value="9:16">9:16</option>
                          <option value="1:1">1:1</option>
                      </select>
-                     <input 
+                     <input
                         type="text"
                         value={selectedFont}
                         onChange={(e) => setSelectedFont(e.target.value)}
                         placeholder="Font (e.g. Avenir)"
-                        className="bg-neutral-800 text-white text-xs px-2 py-1 rounded border border-neutral-700 outline-none w-32"
+                        className="bg-neutral-800 text-white text-xs px-2 py-1 rounded border border-neutral-700 outline-none w-28"
                      />
                  </div>
              </div>
-             
+
              {/* Preview Mode Toggle */}
              <div className="flex gap-2 bg-neutral-800 p-1 rounded">
-                <button 
+                <button
                     onClick={() => setPreviewMode("highlight")}
                     className={cn("flex-1 text-xs py-1 rounded transition-colors", previewMode === "highlight" ? "bg-neutral-600 text-white" : "text-neutral-400 hover:text-white")}
                 >
                     Highlight
                 </button>
-                <button 
+                <button
                     onClick={() => setPreviewMode("typing")}
                     className={cn("flex-1 text-xs py-1 rounded transition-colors", previewMode === "typing" ? "bg-neutral-600 text-white" : "text-neutral-400 hover:text-white")}
                 >
                     Typing Effect
                 </button>
              </div>
-             
+
              {/* Recording UI (Word Preview) - Moved to top */}
              {isSyncing && (
-               <div className="text-center p-4 bg-neutral-950 rounded border border-neutral-800 animate-pulse">
-                 <p className="text-sm text-neutral-400 mb-2">Press <span className="font-bold text-white bg-neutral-800 px-1 rounded">SPACEBAR</span> for next word</p>
-                 <div className="text-4xl font-bold text-blue-500">
+               <div className="text-center p-3 bg-neutral-950 rounded border border-neutral-800 animate-pulse">
+                 <p className="text-xs text-neutral-400 mb-1">Press <span className="font-bold text-white bg-neutral-800 px-1 rounded">SPACEBAR</span> for next word</p>
+                 <div className="text-2xl font-bold text-blue-500">
                    {words[syncIndex]?.text || "Done"}
                  </div>
-                 <p className="text-xs text-neutral-500 mt-2">Next Word</p>
+                 <p className="text-[10px] text-neutral-500 mt-1">Next Word</p>
                </div>
              )}
 
              {/* Sync Buttons */}
-             <div className="flex gap-3">
-               <button 
+             <div className="flex gap-2">
+               <button
                  onClick={(e) => {
                    e.currentTarget.blur();
                    setIsSyncing(!isSyncing);
@@ -548,7 +667,7 @@ export default function SyncStudio() {
                  }}
                  disabled={!audioSrc || !words.length}
                  className={cn(
-                   "flex-1 py-3 rounded font-medium transition-all",
+                   "flex-1 py-2 rounded font-medium transition-all text-xs",
                    isSyncing ? "bg-red-500/20 text-red-400 border border-red-500/50" : "bg-blue-600 hover:bg-blue-500 text-white",
                    (!audioSrc || !words.length) && "opacity-50 cursor-not-allowed"
                  )}
@@ -558,23 +677,61 @@ export default function SyncStudio() {
                 <button
                     onClick={undoLastTimestamp}
                     disabled={syncIndex === 0 && words[0]?.time === null}
-                    className="p-3 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded-md flex items-center justify-center transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="p-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded-md flex items-center justify-center transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                    <Undo2 className="w-5 h-5" />
+                    <Undo2 className="w-4 h-4" />
                 </button>
              </div>
-             
+
              {/* Audio Playback Controls */}
-             <div className="flex items-center gap-4 pt-2 border-t border-neutral-800">
-                <button onClick={togglePlay} className="p-3 bg-white text-black rounded-full hover:bg-neutral-200 transition-colors">
-                  {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5" />}
+             <div className="flex items-center gap-2 pt-2 border-t border-neutral-800">
+                {/* Seek Controls */}
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={() => seekAudio(-1)}
+                    className="p-1.5 bg-neutral-800 hover:bg-neutral-700 rounded transition-colors"
+                    title="Seek -1s (Shift+Left)"
+                  >
+                    <ChevronsLeft className="w-3 h-3" />
+                  </button>
+                  <button
+                    onClick={() => seekAudio(-0.1)}
+                    className="p-1.5 bg-neutral-800 hover:bg-neutral-700 rounded transition-colors"
+                    title="Seek -0.1s (Left)"
+                  >
+                    <ChevronLeft className="w-3 h-3" />
+                  </button>
+                </div>
+
+                {/* Play/Pause */}
+                <button onClick={togglePlay} className="p-2 bg-white text-black rounded-full hover:bg-neutral-200 transition-colors">
+                  {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
                 </button>
+
+                {/* Seek Controls */}
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={() => seekAudio(0.1)}
+                    className="p-1.5 bg-neutral-800 hover:bg-neutral-700 rounded transition-colors"
+                    title="Seek +0.1s (Right)"
+                  >
+                    <ChevronRight className="w-3 h-3" />
+                  </button>
+                  <button
+                    onClick={() => seekAudio(1)}
+                    className="p-1.5 bg-neutral-800 hover:bg-neutral-700 rounded transition-colors"
+                    title="Seek +1s (Shift+Right)"
+                  >
+                    <ChevronsRight className="w-3 h-3" />
+                  </button>
+                </div>
+
                 <div className="flex-1 flex flex-col justify-center">
                    <input
                       type="range"
                       min={0}
                       max={audioRef.current?.duration || 100}
-                      step="0.1"
+                      step="0.01"
                       value={currentTime}
                       onChange={(e) => {
                           const newTime = parseFloat(e.target.value);
@@ -582,12 +739,17 @@ export default function SyncStudio() {
                           if (audioRef.current) {
                               audioRef.current.currentTime = newTime;
                           }
+                          // Clear word play mode when manually seeking with slider
+                          wordPlayEndTime.current = null;
                       }}
-                      className="w-full h-2 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                      className="w-full h-1.5 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-blue-500"
                     />
-                  <div className="flex justify-between text-xs text-neutral-500 mt-1">
-                    <span>{currentTime.toFixed(1)}s</span>
-                    <span>{audioRef.current?.duration.toFixed(1) || "0.0"}s</span>
+                  <div className="flex justify-between text-[10px] text-neutral-500 mt-1">
+                    <span>{currentTime.toFixed(2)}s</span>
+                    <span>{audioRef.current?.duration.toFixed(2) || "0.00"}s</span>
+                  </div>
+                  <div className="text-[9px] text-neutral-600 mt-0.5 text-center">
+                    ←/→: 0.1s | Shift+←/→: 1s
                   </div>
                 </div>
              </div>
@@ -596,10 +758,10 @@ export default function SyncStudio() {
         </div>
 
         {/* Right Panel: Preview */}
-        <div className="lg:col-span-2 flex flex-col gap-4">
-          <h2 className="font-semibold text-neutral-400 text-sm uppercase tracking-wider">Preview Canvas ({aspectRatio})</h2>
-          
-          <div className={cn("relative w-full bg-black rounded-lg border border-neutral-800 overflow-hidden shadow-2xl transition-all duration-500", getPreviewPadding())}>
+        <div className="lg:col-span-2 flex flex-col gap-3 overflow-hidden min-h-0">
+          <h2 className="font-semibold text-neutral-400 text-xs uppercase tracking-wider">Preview Canvas ({aspectRatio})</h2>
+
+          <div className={cn("relative w-full bg-black rounded-lg border border-neutral-800 overflow-hidden shadow-2xl transition-all duration-500 flex-1", getPreviewPadding())}>
              {videoUrl ? (
                  <>
                     <video src={videoUrl} controls className="absolute inset-0 w-full h-full object-contain" />
@@ -612,32 +774,29 @@ export default function SyncStudio() {
              ) : (
                  <div className="absolute inset-0 flex flex-col items-center justify-center p-12 text-center">
                     {/* Title Layer */}
-                    <div className="absolute top-[12%] text-white text-4xl md:text-6xl font-bold opacity-100">
+                    <div className="absolute top-[12%] text-white text-3xl md:text-5xl font-bold opacity-100" style={{fontFamily: 'Avenir, sans-serif'}}>
                       DISCLAIMER
                     </div>
-    
+
                     {/* Text Layer */}
                     <div className="w-[80%] h-[60%] flex items-center justify-center">
-                       <p className="text-xl md:text-3xl lg:text-4xl leading-relaxed font-serif text-neutral-800 transition-all duration-75">
+                       <p className="text-lg md:text-2xl lg:text-3xl leading-relaxed font-serif transition-all duration-75">
                           {previewMode === "typing" ? (
-                              // Typing Effect Render
+                              // Typing Effect Render - full text with invisible unrevealed characters
                               <>
                                 <span className="text-white">
                                     {words.map(w => w.text).join(" ").slice(0, visibleCharCount)}
                                 </span>
-                                <span className="opacity-0">
+                                <span className="opacity-0 invisible">
                                     {words.map(w => w.text).join(" ").slice(visibleCharCount)}
                                 </span>
                               </>
                           ) : (
-                              // Highlight Mode Render
+                              // Highlight Mode Render - full text with invisible unrevealed words
                               words.map((word, i) => (
-                                <span 
-                                  key={i} 
-                                  className={cn(
-                                    "transition-colors duration-0", 
-                                    i < visibleWordCount ? "text-white" : "text-neutral-900" 
-                                  )}
+                                <span
+                                  key={i}
+                                  className={i < visibleWordCount ? "text-white" : "opacity-0 invisible"}
                                 >
                                   {word.text}{" "}
                                 </span>
@@ -657,18 +816,15 @@ export default function SyncStudio() {
           </div>
 
           {/* Instructions */}
-          {/* ... */}
-          <div className="bg-neutral-900/50 p-4 rounded text-sm text-neutral-400">
-            <p className="font-semibold text-neutral-300 mb-1">How to use:</p>
-            <ol className="list-decimal list-inside space-y-1">
-              <li>Upload your audio file.</li>
-              <li>Paste your script.</li>
-              <li>Select Aspect Ratio (e.g. 9:16 for Reels).</li>
-              <li>Click <strong>START RECORDING</strong>. The audio will play.</li>
-              <li>Tap <strong>SPACEBAR</strong> exactly when each word is spoken.</li>
-              <li>Use the Timestamps editor to tweak precise timings.</li>
-              <li>Switch to <strong>Typing Effect</strong> to preview the animation.</li>
-              <li>When finished, click <strong>Generate Video</strong>.</li>
+          <div className="bg-neutral-900/50 p-3 rounded text-xs text-neutral-400">
+            <p className="font-semibold text-neutral-300 mb-1 text-xs">Quick Guide:</p>
+            <ol className="list-decimal list-inside space-y-0.5 text-[11px]">
+              <li>Upload audio & paste script</li>
+              <li>Click <strong>START RECORDING</strong> and tap <strong>SPACEBAR</strong> for each word</li>
+              <li>Fine-tune timings: type values or use <strong>▶ button</strong> to preview each word</li>
+              <li>Use arrow keys (←/→) or seek buttons for precise audio control</li>
+              <li>Preview with <strong>Typing Effect</strong> mode</li>
+              <li>Click <strong>Generate Video</strong></li>
             </ol>
           </div>
         </div>
