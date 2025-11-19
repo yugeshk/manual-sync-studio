@@ -580,26 +580,14 @@ export default function SyncStudio() {
       }
   }, [aspectRatio]);
 
-  // --- Preview Helper (visibleWordCount) ---
+  // --- Preview Helper (visibleWordCount) - not used anymore, kept for compatibility ---
   const visibleWordCount = useMemo(() => {
-    if (previewMode !== "highlight") return 0; 
-
-    if (!words.length) return 0;
-    
-    let count = 0;
-    for (const w of words) {
-      if (w.time !== null && w.time <= currentTime) {
-        count++;
-      } else {
-        break;
-      }
-    }
-    return count;
+    return 0; // Highlight now uses character-based reveal
   }, [currentTime, words, previewMode]);
 
   // --- Preview Helper (visibleCharCount) ---
   const visibleCharCount = useMemo(() => {
-    if (previewMode !== "typing" && previewMode !== "smooth") return 0;
+    // Now used by all modes: typing, smooth, and highlight
     
     if (!words.length) return 0;
     
@@ -1045,15 +1033,15 @@ export default function SyncStudio() {
                                 ))}
                               </>
                           ) : (
-                              // Highlight Mode Render - full text with invisible unrevealed words
-                              words.map((word, i) => (
-                                <span
-                                  key={i}
-                                  className={i < visibleWordCount ? "text-white" : "opacity-0 invisible"}
-                                >
-                                  {word.text}{" "}
+                              // Highlight Mode Render - character-by-character reveal per word
+                              <>
+                                <span className="text-white">
+                                    {words.map(w => w.text).join(" ").slice(0, visibleCharCount)}
                                 </span>
-                              ))
+                                <span className="opacity-0 invisible">
+                                    {words.map(w => w.text).join(" ").slice(visibleCharCount)}
+                                </span>
+                              </>
                           )}
                        </p>
                     </div>
