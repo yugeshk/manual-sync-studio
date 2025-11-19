@@ -4,6 +4,7 @@ import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react'
 import { Play, Pause, Download, Upload, RefreshCw, Type, Undo2, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight } from 'lucide-react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { motion, AnimatePresence } from 'framer-motion';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -31,13 +32,18 @@ export default function SyncStudio() {
   const [aspectRatio, setAspectRatio] = useState<"16:9" | "9:16" | "1:1">("16:9");
   const [isRendering, setIsRendering] = useState(false);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
-  const [previewMode, setPreviewMode] = useState<"highlight" | "typing">("highlight");
+  const [previewMode, setPreviewMode] = useState<"highlight" | "typing" | "smooth">("highlight");
   const [selectedFont, setSelectedFont] = useState<string>("DevanagariMT");
 
   const audioRef = useRef<HTMLAudioElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const hasInitialized = useRef(false);
   const wordPlayEndTime = useRef<number | null>(null);
+  const previewCanvasRef = useRef<HTMLDivElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  const renderCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
 
   // --- Initialization Logic ---
   const initializeWords = useCallback(() => {
@@ -281,66 +287,286 @@ export default function SyncStudio() {
   }, [audioSrc]); // Re-run when audio source changes
 
 
-  // --- Generation Logic ---
+  // Helper function to calculate visible character count at a given time
+  const getVisibleCharsAtTime = (time: number): number => {
+    if (!words.length) return 0;
+
+    let currentWordIndex = -1;
+    for (let i = 0; i < words.length; i++) {
+      const w = words[i];
+      if (w.time !== null && w.time <= time) {
+        currentWordIndex = i;
+      } else {
+        break;
+      }
+    }
+
+    if (currentWordIndex === -1) return 0;
+
+    const currentWord = words[currentWordIndex];
+    if (!currentWord) return 0;
+
+    const startTime = currentWord.time || 0;
+    let endTime = 0;
+
+    if (currentWord.endTime !== null) {
+      endTime = currentWord.endTime;
+    } else if (currentWordIndex < words.length - 1 && words[currentWordIndex + 1].time !== null) {
+      endTime = words[currentWordIndex + 1].time!;
+    } else {
+      endTime = startTime + 0.5;
+    }
+
+    endTime = Math.max(endTime, startTime + 0.05);
+    const duration = Math.max(endTime - startTime, 0.01);
+    const progress = Math.min(Math.max((time - startTime) / duration, 0), 1);
+
+    const wordLen = currentWord.text.length;
+    const charsRevealed = Math.floor(progress * wordLen);
+
+    let total = 0;
+    for (let i = 0; i < currentWordIndex; i++) {
+      total += words[i].text.length + 1;
+    }
+    total += charsRevealed;
+
+    return total;
+  };
+
+  // --- Generation Logic (Canvas-Based Recording) ---
   const handleGenerateVideo = async () => {
-    if (!audioSrc || !words.length) {
+    if (!audioSrc || !words.length || !audioRef.current) {
       alert("Please upload audio and script first.");
       return;
     }
     const hasUntimedWords = words.some(w => w.time === null);
     if (hasUntimedWords && !confirm("Some words are not timed. Continue with generation? Untimed words will use interpolated timings.")) {
-        return;
+      return;
     }
-    
-    setIsRendering(true);
-    setVideoUrl(null); 
-    try {
-        const response = await fetch(audioSrc);
-        const audioBlob = await response.blob();
-        
-        const data = {
-            text: scriptText,
-            words: words.map(w => ({
-                word: w.text,
-                time: w.time || 0,
-                endTime: w.endTime || null
-            }))
-        };
 
-        let width = 1920;
-        let height = 1080;
-        if (aspectRatio === "9:16") {
-            width = 1080;
-            height = 1920;
-        } else if (aspectRatio === "1:1") {
-            width = 1080;
-            height = 1080;
+    setIsRendering(true);
+    setVideoUrl(null);
+    recordedChunksRef.current = [];
+
+    try {
+      // Set up canvas dimensions based on aspect ratio
+      let width = 1920, height = 1080;
+      if (aspectRatio === "9:16") {
+        width = 1080;
+        height = 1920;
+      } else if (aspectRatio === "1:1") {
+        width = 1080;
+        height = 1080;
+      }
+
+      // Create offscreen canvas for rendering
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d')!;
+      renderCanvasRef.current = canvas;
+
+      // Get audio duration
+      const audioDuration = audioRef.current.duration;
+      const fps = 30;
+
+      // Clone audio element to avoid "already connected" error
+      const audioClone = new Audio(audioSrc);
+      audioClone.load();
+      await new Promise(resolve => audioClone.onloadedmetadata = resolve);
+
+      // Set up audio stream
+      const audioContext = new AudioContext();
+      const source = audioContext.createMediaElementSource(audioClone);
+      const destination = audioContext.createMediaStreamDestination();
+      source.connect(destination);
+      source.connect(audioContext.destination);
+
+      // Capture canvas stream
+      const canvasStream = canvas.captureStream(fps);
+
+      // Combine streams
+      const combinedStream = new MediaStream([
+        ...canvasStream.getVideoTracks(),
+        ...destination.stream.getAudioTracks()
+      ]);
+
+      // Set up recorder
+      let mimeType = 'video/webm;codecs=vp9';
+      if (!MediaRecorder.isTypeSupported(mimeType)) {
+        mimeType = 'video/webm;codecs=vp8';
+      }
+      if (!MediaRecorder.isTypeSupported(mimeType)) {
+        mimeType = 'video/webm';
+      }
+
+      const recorder = new MediaRecorder(combinedStream, {
+        mimeType,
+        videoBitsPerSecond: 8000000
+      });
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          recordedChunksRef.current.push(event.data);
         }
-        
-        const formData = new FormData();
-        formData.append('audio', audioBlob, 'audio.m4a');
-        formData.append('timestamps', JSON.stringify(data));
-        formData.append('width', width.toString());
-        formData.append('height', height.toString());
-        formData.append('font', selectedFont); 
-        
-        const res = await fetch('/api/render', {
-            method: 'POST',
-            body: formData
-        });
-        
-        const result = await res.json();
-        
-        if (result.success) {
-            setVideoUrl(result.videoUrl);
-        } else {
-            alert('Error: ' + result.error);
-        }
-    } catch (e: any) {
-        console.error(e);
-        alert('Failed to generate video: ' + (e.message || 'Unknown error'));
-    } finally {
+      };
+
+      recorder.onstop = () => {
+        const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
+        const url = URL.createObjectURL(blob);
+        setVideoUrl(url);
         setIsRendering(false);
+
+        // Download
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `disclaimer-${Date.now()}.webm`;
+        a.click();
+      };
+
+      // Start recording
+      recorder.start(100);
+      mediaRecorderRef.current = recorder;
+
+      // Start both audio playbacks - original for preview, clone for recording
+      audioRef.current.currentTime = 0;
+      audioClone.currentTime = 0;
+
+      // Play both in sync
+      await Promise.all([
+        audioRef.current.play(),
+        audioClone.play()
+      ]);
+      setIsPlaying(true);
+
+      // Render loop
+      const fullText = words.map(w => w.text).join(" ");
+
+      const render = () => {
+        const audioTime = audioClone.currentTime;
+
+        // Clear canvas
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(0, 0, width, height);
+
+        // Draw DISCLAIMER title
+        ctx.fillStyle = '#ffffff';
+        ctx.font = `bold ${width * 0.06}px Avenir, sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.fillText('DISCLAIMER', width / 2, height * 0.18);
+
+        // Calculate visible characters
+        const visibleChars = getVisibleCharsAtTime(audioTime);
+        const visibleText = fullText.slice(0, visibleChars);
+
+        ctx.font = `${width * 0.024}px serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+
+        // Word wrap the FULL text to get correct layout
+        const maxWidth = width * 0.8;
+        const lineHeight = width * 0.035;
+        const allWords = fullText.split(' ');
+        let line = '';
+        const allLines: string[] = [];
+
+        for (let i = 0; i < allWords.length; i++) {
+          const testLine = line + allWords[i] + ' ';
+          const metrics = ctx.measureText(testLine);
+          if (metrics.width > maxWidth && i > 0) {
+            allLines.push(line);
+            line = allWords[i] + ' ';
+          } else {
+            line = testLine;
+          }
+        }
+        allLines.push(line);
+
+        // Now figure out which lines and partial content to show
+        let charCount = 0;
+        const linesToRender: { text: string; visible: boolean; partialChars?: number }[] = [];
+
+        for (const fullLine of allLines) {
+          const lineLength = fullLine.length;
+
+          if (charCount + lineLength <= visibleChars) {
+            // Entire line is visible
+            linesToRender.push({ text: fullLine, visible: true });
+            charCount += lineLength;
+          } else if (charCount < visibleChars) {
+            // Partial line is visible
+            const charsToShow = visibleChars - charCount;
+            linesToRender.push({ text: fullLine, visible: true, partialChars: charsToShow });
+            charCount += lineLength;
+          } else {
+            // Line is not visible yet - but we still track it for layout
+            linesToRender.push({ text: fullLine, visible: false });
+            charCount += lineLength;
+          }
+        }
+
+        // Center vertically based on total lines
+        let y = height / 2 - (allLines.length * lineHeight) / 2;
+
+        // Render each line
+        linesToRender.forEach((lineInfo, i) => {
+          if (lineInfo.visible) {
+            const textToRender = lineInfo.partialChars !== undefined
+              ? lineInfo.text.slice(0, lineInfo.partialChars)
+              : lineInfo.text;
+
+            // Measure the FULL line to get proper centering
+            const fullLineWidth = ctx.measureText(lineInfo.text.trim()).width;
+            const xStart = (width - fullLineWidth) / 2;
+
+            // Draw text left-aligned from the calculated start position
+            ctx.fillStyle = '#ffffff';
+            ctx.textAlign = 'left';
+            ctx.fillText(textToRender, xStart, y + i * lineHeight);
+          }
+        });
+
+        // Continue rendering if audio is still playing
+        if (audioTime < audioDuration) {
+          requestAnimationFrame(render);
+        }
+      };
+
+      render();
+
+      // Stop recording when audio ends
+      audioClone.onended = () => {
+        setTimeout(() => {
+          if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+            recorder.stop();
+          }
+          setIsPlaying(false);
+          audioContext.close();
+
+          // Also stop the original audio
+          if (audioRef.current) {
+            audioRef.current.pause();
+            audioRef.current.currentTime = 0;
+          }
+        }, 500);
+      };
+
+      // Also handle if original audio ends first
+      audioRef.current.onended = () => {
+        audioClone.pause();
+        setTimeout(() => {
+          if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+            recorder.stop();
+          }
+          setIsPlaying(false);
+          audioContext.close();
+        }, 500);
+      };
+
+    } catch (e: any) {
+      console.error(e);
+      alert('Failed to generate video: ' + (e.message || 'Unknown error'));
+      setIsRendering(false);
     }
   };
 
@@ -373,7 +599,7 @@ export default function SyncStudio() {
 
   // --- Preview Helper (visibleCharCount) ---
   const visibleCharCount = useMemo(() => {
-    if (previewMode !== "typing") return 0;
+    if (previewMode !== "typing" && previewMode !== "smooth") return 0;
     
     if (!words.length) return 0;
     
@@ -626,18 +852,24 @@ export default function SyncStudio() {
              </div>
 
              {/* Preview Mode Toggle */}
-             <div className="flex gap-2 bg-neutral-800 p-1 rounded">
+             <div className="flex gap-1 bg-neutral-800 p-1 rounded">
                 <button
                     onClick={() => setPreviewMode("highlight")}
-                    className={cn("flex-1 text-xs py-1 rounded transition-colors", previewMode === "highlight" ? "bg-neutral-600 text-white" : "text-neutral-400 hover:text-white")}
+                    className={cn("flex-1 text-[10px] py-1 rounded transition-colors", previewMode === "highlight" ? "bg-neutral-600 text-white" : "text-neutral-400 hover:text-white")}
                 >
                     Highlight
                 </button>
                 <button
                     onClick={() => setPreviewMode("typing")}
-                    className={cn("flex-1 text-xs py-1 rounded transition-colors", previewMode === "typing" ? "bg-neutral-600 text-white" : "text-neutral-400 hover:text-white")}
+                    className={cn("flex-1 text-[10px] py-1 rounded transition-colors", previewMode === "typing" ? "bg-neutral-600 text-white" : "text-neutral-400 hover:text-white")}
                 >
-                    Typing Effect
+                    Typing
+                </button>
+                <button
+                    onClick={() => setPreviewMode("smooth")}
+                    className={cn("flex-1 text-[10px] py-1 rounded transition-colors", previewMode === "smooth" ? "bg-neutral-600 text-white" : "text-neutral-400 hover:text-white")}
+                >
+                    Smooth
                 </button>
              </div>
 
@@ -772,7 +1004,7 @@ export default function SyncStudio() {
                     </button>
                  </>
              ) : (
-                 <div className="absolute inset-0 flex flex-col items-center justify-center p-12 text-center">
+                 <div ref={previewCanvasRef} className="absolute inset-0 flex flex-col items-center justify-center p-12 text-center">
                     {/* Title Layer */}
                     <div className="absolute top-[12%] text-white text-3xl md:text-5xl font-bold opacity-100" style={{fontFamily: 'Avenir, sans-serif'}}>
                       DISCLAIMER
@@ -790,6 +1022,27 @@ export default function SyncStudio() {
                                 <span className="opacity-0 invisible">
                                     {words.map(w => w.text).join(" ").slice(visibleCharCount)}
                                 </span>
+                              </>
+                          ) : previewMode === "smooth" ? (
+                              // Smooth Animation Mode - smooth character reveal
+                              <>
+                                {words.map(w => w.text).join(" ").split('').map((char, i) => (
+                                  <motion.span
+                                    key={i}
+                                    initial={{ opacity: 0, y: 10 }}
+                                    animate={{
+                                      opacity: i < visibleCharCount ? 1 : 0,
+                                      y: i < visibleCharCount ? 0 : 10
+                                    }}
+                                    transition={{
+                                      duration: 0.3,
+                                      ease: "easeOut"
+                                    }}
+                                    className={i >= visibleCharCount ? "invisible" : ""}
+                                  >
+                                    {char}
+                                  </motion.span>
+                                ))}
                               </>
                           ) : (
                               // Highlight Mode Render - full text with invisible unrevealed words
